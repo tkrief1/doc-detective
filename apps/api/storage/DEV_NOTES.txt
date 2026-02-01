@@ -52,7 +52,3 @@ drwxr-xr-x 4 tkrief14 tkrief14 4096 Jan 28 16:29 alembic
 -rw-r--r-- 1 tkrief14 tkrief14  753 Jan 28 16:22 models.py
 -rw-r--r-- 1 tkrief14 tkrief14   86 Jan 28 15:56 requirements.txt
 drwxr-xr-x 2 tkrief14 tkrief14 4096 Jan 28 16:29 storage
-
-## Feb 1, 2026 notes
-- Postman POST /documents returns 422 missing body.file, even though form-data file key set.
-- Next: check Postman code snippet and compare with curl; try FastAPI /docs upload; verify Content-Type boundary.
