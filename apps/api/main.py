@@ -1,4 +1,6 @@
 import os
+import hashlib
+import re
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -9,10 +11,32 @@ from chunking import chunk_text
 from embeddings import embed_texts
 from sqlalchemy import text
 from pydantic import BaseModel
+from extractive import extract_relevant_lines
+from extractors import extract_text
+from chunking import chunk_extracted
 
 class SearchRequest(BaseModel):
     query: str
     top_k: int = 5
+    document_id: int | None = None
+
+class AnswerRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    max_sources: int = 3
+    document_id: int | None = None
+
+def confidence_from_distance(score: float) -> str:
+    # If we're not using real embeddings, don't pretend precision
+    if not os.getenv("OPENAI_API_KEY"):
+        return "experimental"
+
+    # Real embedding thresholds (tune later)
+    if score <= 0.25:
+        return "high"
+    if score <= 0.5:
+        return "medium"
+    return "low"
 
 app = FastAPI(title="Doc Detective API")
 
@@ -88,22 +112,27 @@ def chunk_document(doc_id: int, db: Session = Depends(get_db)):
     if not path.exists():
         raise HTTPException(status_code=500, detail="Stored file missing")
 
-    # MVP: only text files first
-    if doc.content_type not in ("text/plain", "text/markdown"):
-        raise HTTPException(status_code=400, detail=f"Unsupported content_type for MVP chunking: {doc.content_type}")
+    extracted = extract_text(path, doc.content_type)
+    if not extracted:
+        raise HTTPException(status_code=400, detail="No extractable text found in file")
 
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    parts = chunk_text(text)
+    chunk_pairs = chunk_extracted(extracted)
 
     # Clear existing chunks if reprocessing
     db.query(Chunk).filter(Chunk.document_id == doc_id).delete()
 
-    for idx, content in enumerate(parts):
-        db.add(Chunk(document_id=doc_id, chunk_index=idx, page=None, content=content))
+    for idx, (page, content) in enumerate(chunk_pairs):
+        db.add(
+            Chunk(
+                document_id=doc_id,
+                chunk_index=idx,
+                page=page,
+                content=content,
+            )
+        )
 
     db.commit()
-
-    return {"document_id": doc_id, "chunks_created": len(parts)}
+    return {"document_id": doc_id, "chunks_created": len(chunk_pairs)}
 
 @app.get("/documents/{doc_id}/chunks")
 def get_chunks(doc_id: int, db: Session = Depends(get_db)):
@@ -155,6 +184,13 @@ def search(req: SearchRequest, db: Session = Depends(get_db)):
         .all()
     )
 
+    q = db.query(Chunk, (Chunk.embedding.cosine_distance(qvec)).label("score")).filter(Chunk.embedding.isnot(None))
+
+    if req.document_id is not None:
+        q = q.filter(Chunk.document_id == req.document_id)
+
+    results = q.order_by("score").limit(req.top_k).all()
+
     return [
         {
             "chunk_id": chunk.id,
@@ -166,3 +202,132 @@ def search(req: SearchRequest, db: Session = Depends(get_db)):
         }
         for chunk, score in results
     ]
+
+def _extract_company_from_text(text: str) -> str | None:
+    """
+    Heuristic for 'what company is this for' on cover letters:
+    look for 'Dear' and grab the few lines before it (often contains company).
+    Also tries to reconstruct line-broken company names in PDFs.
+    """
+    # normalize weird PDF whitespace
+    cleaned = re.sub(r"[ \t]+", " ", text)
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+
+    # try: lines before "Dear"
+    for i, ln in enumerate(lines):
+        if ln.lower().startswith("dear"):
+            window = lines[max(0, i - 6): i]  # up to 6 lines before Dear
+            # pick the most "name-like" line (letters/spaces, not phone/email/date)
+            candidates = []
+            for w in window:
+                if any(x in w.lower() for x in ["@", "http", "linkedin", "github"]):
+                    continue
+                if re.search(r"\d", w):  # skip dates/addresses
+                    continue
+                if len(w) < 3:
+                    continue
+                candidates.append(w)
+            if candidates:
+                # PDFs often break company names across lines (e.g., Hudson / River / Trading)
+                tail = candidates[-4:]  # up to last 4 lines before "Dear"
+                joined = " ".join(tail)
+
+                # clean up accidental double spaces
+                joined = re.sub(r"\s{2,}", " ", joined).strip()
+
+                # remove common header noise
+                joined = re.sub(r"(?i)\bhiring manager\b", "", joined).strip()
+                joined = re.sub(r"\s{2,}", " ", joined).strip()
+
+                return joined
+
+    # fallback: common cover-letter pattern "Hudson River Trading" may be line-broken;
+    # just return the first capitalized phrase-like line we can find.
+    for ln in lines[:40]:
+        if re.fullmatch(r"[A-Za-z][A-Za-z .&'-]{2,}", ln) and len(ln.split()) >= 2:
+            return ln
+
+    return None
+
+@app.post("/answer")
+@app.post("/answer")
+def answer(req: AnswerRequest, db: Session = Depends(get_db)):
+    qvec = embed_texts([req.query])[0]
+
+    # IMPORTANT: apply the document_id filter here (before ordering/limit)
+    q = (
+        db.query(Chunk, (Chunk.embedding.cosine_distance(qvec)).label("score"))
+        .filter(Chunk.embedding.isnot(None))
+    )
+    if req.document_id is not None:
+        q = q.filter(Chunk.document_id == req.document_id)
+
+    results = (
+        q.order_by("score")  # cosine distance: lower is better
+         .limit(req.top_k)
+         .all()
+    )
+
+    if not results:
+        return {
+            "answer": "No matching embedded chunks found. Upload → chunk → embed this document first.",
+            "confidence": "experimental",
+            "citations": [],
+            "sources": [],
+        }
+
+    # Deduplicate by normalized content (collapses duplicates across docs/files)
+    unique: list[tuple[Chunk, float]] = []
+    seen: set[str] = set()
+
+    for chunk, score in results:
+        norm = " ".join(chunk.content.split())
+        h = hashlib.sha1(norm.encode("utf-8")).hexdigest()
+        if h in seen:
+            continue
+        seen.add(h)
+        unique.append((chunk, float(score)))
+
+    top = unique[: max(1, min(req.max_sources, len(unique)))]
+    best_chunk, best_score = top[0][0], float(top[0][1])
+
+    # Special-case company questions to avoid weird line overlap issues on PDFs
+    qlower = req.query.lower()
+    if any(k in qlower for k in ["what company", "which company", "who is this for", "company is this", "cover letter for"]):
+        company = _extract_company_from_text(best_chunk.content)
+        snippet = company if company else extract_relevant_lines(req.query, best_chunk.content, max_lines=4)
+    else:
+        snippet = extract_relevant_lines(req.query, best_chunk.content, max_lines=4)
+
+    # Build citations + sources (include page in citation text)
+    citations = []
+    sources = []
+    for i, (chunk, score) in enumerate(top, start=1):
+        citations.append({"ref": f"[{i}]", "chunk_id": chunk.id, "document_id": chunk.document_id})
+        sources.append({
+            "ref": f"[{i}]",
+            "chunk_id": chunk.id,
+            "document_id": chunk.document_id,
+            "chunk_index": chunk.chunk_index,
+            "page": chunk.page,
+            "score": float(score),
+            "preview": chunk.content[:300],
+        })
+
+    pretty = []
+    for s in sources:
+        p = s["page"]
+        if p is None:
+            pretty.append(f'{s["ref"]} doc {s["document_id"]}')
+        else:
+            pretty.append(f'{s["ref"]} doc {s["document_id"]} p.{p}')
+    pretty_citations = "; ".join(pretty)
+
+    answer_text = f"{snippet}\n\nCitations: {pretty_citations}"
+
+    return {
+        "answer": answer_text,
+        "confidence": confidence_from_distance(best_score),
+        "citations": citations,
+        "sources": sources,
+    }
