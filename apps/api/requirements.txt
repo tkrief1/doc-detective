@@ -6,3 +6,5 @@ sqlalchemy
 alembic
 pydantic
 openai
+pypdf
+python-docx
