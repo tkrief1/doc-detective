@@ -3,6 +3,7 @@ import hashlib
 import re
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from db import SessionLocal
@@ -39,6 +40,17 @@ def confidence_from_distance(score: float) -> str:
     return "low"
 
 app = FastAPI(title="Doc Detective API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 STORAGE_DIR = Path(os.getenv("STORAGE_DIR", "storage"))
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)

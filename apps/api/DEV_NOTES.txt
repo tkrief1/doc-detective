@@ -64,3 +64,8 @@ drwxr-xr-x 2 tkrief14 tkrief14 4096 Jan 28 16:29 storage
 - /answer supports document_id filter + content-dedupe + page-aware citations
 - Company extraction from PDF line breaks improved (Hudson River Trading example)
 Next: frontend (doc picker + upload + ask + citations UI)
+
+## Feb 5, 2026
+- Frontend (Vite + React TS) working: upload docs, list/select doc, ask questions, show citations.
+- API reachable via http://localhost:8000 (WSL/Windows friendly)
+- Still needs polish: better answer formatting, confidence calibration, source linking (page jumps), and UI refinements.
