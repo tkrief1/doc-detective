@@ -4,13 +4,14 @@ import re
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, Mapped, mapped_column
+from datetime import datetime, timezone
 
-from db import SessionLocal
+from db import SessionLocal, Base
 from models import Document, Chunk
 from chunking import chunk_text
 from embeddings import embed_texts
-from sqlalchemy import text
+from sqlalchemy import text, Boolean, String, DateTime, Integer
 from pydantic import BaseModel
 from extractive import extract_relevant_lines
 from extractors import extract_text
@@ -26,6 +27,28 @@ class AnswerRequest(BaseModel):
     top_k: int = 5
     max_sources: int = 3
     document_id: int | None = None
+
+class Document(Base):
+    __tablename__ = "documents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    stored_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    # NEW: processing status fields
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chunked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 def confidence_from_distance(score: float) -> str:
     # If we're not using real embeddings, don't pretend precision
